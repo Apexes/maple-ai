@@ -34,12 +34,14 @@ from .mock_data import (
     build_rng,
     build_extra_rng,
     build_maple_rng,
+    build_b2b_rng,
     generate_history,
     generate_listings,
     generate_extended_listings,
     generate_maple_listings,
+    generate_b2b_listings,
 )
-from .scrapers import run_all_scrapers
+from .scrapers import run_all_scrapers, run_b2b_scrapers
 from .util import as_of_date
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
@@ -103,14 +105,26 @@ def _insert_listings(db: Session, rows: list[dict]) -> None:
 
 
 def _update_today_counts(db: Session, as_of: date) -> None:
-    """Fill today's listing counts on market_daily / device_daily from listings."""
+    """Fill today's listing counts on market_daily / device_daily from listings.
+
+    Counts the RETAIL segment only — the index history and per-device counts
+    describe the B2C market; B2B lot counts are surfaced separately by the B2B
+    agent, so they must not inflate these (keeps retail KPIs byte-identical).
+    """
     today_row = db.scalar(select(MarketDaily).where(MarketDaily.day == as_of))
-    listing_total = db.scalar(select(func.count()).select_from(Listing)) or 0
+    listing_total = (
+        db.scalar(
+            select(func.count()).select_from(Listing).where(Listing.segment == "retail")
+        )
+        or 0
+    )
     if today_row is not None:
         today_row.total_active_listings = int(listing_total)
 
     counts = Counter(
-        r[0] for r in db.execute(select(Listing.sku)).all()
+        r[0] for r in db.execute(
+            select(Listing.sku).where(Listing.segment == "retail")
+        ).all()
     )
     for sku, c in counts.items():
         db.execute(
@@ -145,6 +159,8 @@ def seed_all(db: Session, force: bool = False, ignore_fixture: bool = False) -> 
     listings = generate_listings(cfg, as_of, rng)
     listings += generate_extended_listings(cfg, as_of, build_extra_rng(cfg))
     listings += generate_maple_listings(cfg, as_of, build_maple_rng(cfg))
+    # B2B wholesale segment — own RNG (seed+3), excluded from the retail benchmark.
+    listings += generate_b2b_listings(cfg, as_of, build_b2b_rng(cfg))
     market_daily, device_daily = generate_history(cfg, as_of, rng)
 
     _insert_listings(db, listings)
@@ -170,14 +186,32 @@ def refresh_market(db: Session) -> dict:
     as_of = as_of_date()
 
     if cfg.infra.data_source == "real":
+        # Retail refresh only — the scraped B2B segment is owned by the daily
+        # refresh_b2b cycle and must NOT be overwritten with synthetic rows.
         listings, report = run_all_scrapers(as_of)
         listings += generate_extended_listings(cfg, as_of, build_extra_rng(cfg))
         live = sum(r["count"] for r in report if r["source"] == "live")
         mock = sum(r["count"] for r in report if r["source"] == "mock")
+
+        db.execute(delete(Listing).where(Listing.segment == "retail"))
+        db.commit()
+        _insert_listings(db, listings)
+        db.commit()
+        _update_today_counts(db, as_of)
+        db.commit()
+        return {
+            "refreshed": True,
+            "data_source": cfg.infra.data_source,
+            "total_listings": len(listings),
+            "live_listings": live,
+            "mock_listings": mock,
+            "platforms": report,
+        }
     else:
         listings = generate_listings(cfg, as_of, build_rng(cfg))
         listings += generate_extended_listings(cfg, as_of, build_extra_rng(cfg))
         listings += generate_maple_listings(cfg, as_of, build_maple_rng(cfg))
+        listings += generate_b2b_listings(cfg, as_of, build_b2b_rng(cfg))
         report = [{"platform": "mock", "source": "mock", "count": len(listings)}]
         live, mock = 0, len(listings)
 
@@ -193,6 +227,44 @@ def refresh_market(db: Session) -> dict:
         "refreshed": True,
         "data_source": cfg.infra.data_source,
         "total_listings": len(listings),
+        "live_listings": live,
+        "mock_listings": mock,
+        "platforms": report,
+    }
+
+
+def refresh_b2b(db: Session) -> dict:
+    """Re-scrape ONLY the B2B wholesale segment (the daily B2B job).
+
+    Replaces every segment=='b2b' listing. In real mode this drives the
+    authenticated B2B adapters (gsmExchange / IndiaMART / SuperSale via cookie
+    injection), each falling back to its synthetic slice when no session is
+    present. In mock mode it regenerates the deterministic synthetic B2B market.
+    Retail listings are left untouched, so the B2C index/KPIs never move.
+    """
+    cfg = get_config()
+    as_of = as_of_date()
+
+    if cfg.infra.data_source == "real":
+        listings, report = run_b2b_scrapers(as_of)
+        live = sum(r["count"] for r in report if r["source"] == "live")
+        mock = sum(r["count"] for r in report if r["source"] == "mock")
+    else:
+        listings = generate_b2b_listings(cfg, as_of, build_b2b_rng(cfg))
+        report = [{"platform": "b2b_mock", "source": "mock", "count": len(listings)}]
+        live, mock = 0, len(listings)
+
+    db.execute(delete(Listing).where(Listing.segment == "b2b"))
+    db.commit()
+    if listings:
+        _insert_listings(db, listings)
+        db.commit()
+
+    return {
+        "refreshed": True,
+        "segment": "b2b",
+        "data_source": cfg.infra.data_source,
+        "b2b_listings": len(listings),
         "live_listings": live,
         "mock_listings": mock,
         "platforms": report,

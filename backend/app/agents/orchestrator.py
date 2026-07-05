@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from ..config import get_config
 from ..models import MarketDaily
 from .arbitrage import ArbitrageAgent
+from .b2b_pricing import B2BPricingAgent
 from .competitor import CompetitorIntelligenceAgent
 from .device_pricing import DevicePricingAgent
 from .dubai import DubaiExpansionAgent
@@ -31,6 +32,7 @@ AGENTS = {
     DubaiExpansionAgent.name: DubaiExpansionAgent,
     MapleComparisonAgent.name: MapleComparisonAgent,
     MLPricingAgent.name: MLPricingAgent,
+    B2BPricingAgent.name: B2BPricingAgent,
 }
 
 

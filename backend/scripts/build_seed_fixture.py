@@ -94,9 +94,9 @@ def _build(as_of: str, out: Path) -> None:
 # Columns to persist per table. `id` and `created_at` are intentionally omitted
 # so the loader lets the database assign them (keeps Postgres sequences sane).
 _LISTING_FIELDS = (
-    "platform", "region", "sku", "series", "model", "variant", "storage",
+    "platform", "region", "segment", "sku", "series", "model", "variant", "storage",
     "battery_health", "condition", "raw_condition", "city",
-    "asking_price", "asking_price_native", "currency", "seller_type",
+    "asking_price", "asking_price_native", "currency", "seller_type", "quantity",
     "color", "listing_title", "seller_name", "seller_rating", "seller_reviews",
     "warranty", "accessories", "lock_status", "verified", "negotiable", "views",
     "listing_date", "url",

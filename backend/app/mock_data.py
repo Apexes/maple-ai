@@ -370,7 +370,10 @@ def generate_listings(cfg: MapleConfig, as_of: date, rng: random.Random) -> list
     """
     listings: list[dict] = []
     for platform in cfg.platforms:
-        if platform.role == "own":
+        # Own store and B2B wholesale sources run on their OWN RNG streams
+        # (generate_maple_listings / generate_b2b_listings) so the competitor
+        # stream — and the 96.43 index it drives — stays byte-identical.
+        if platform.role in ("own", "b2b_wholesale"):
             continue
         listings.extend(generate_platform_listings(cfg, platform.key, as_of, rng))
     return listings
@@ -572,8 +575,9 @@ def generate_extended_listings(cfg: MapleConfig, as_of: date, rng: random.Random
     listings: list[dict] = []
     for platform in cfg.platforms:
         # Only include IN-region platforms (skip Dubai for extended devices).
-        # Maple's own store is handled separately by generate_maple_listings.
-        if platform.region != "IN" or platform.role == "own":
+        # Maple's own store and B2B wholesale sources are handled separately
+        # (generate_maple_listings / generate_b2b_listings) on their own RNGs.
+        if platform.region != "IN" or platform.role in ("own", "b2b_wholesale"):
             continue
         for device in EXTRA_DEVICES:
             true_val = true_superb_value(device, as_of)
@@ -582,4 +586,152 @@ def generate_extended_listings(cfg: MapleConfig, as_of: date, rng: random.Random
                 listings.append(
                     _make_listing(cfg, device, platform, true_val, as_of, rng)
                 )
+    return listings
+
+
+# --------------------------------------------------------------------------- #
+# B2B / wholesale segment (separate RNG stream — keeps the retail index at 96.43)
+# --------------------------------------------------------------------------- #
+# Each B2B source covers a different slice of the catalogue, mirroring reality:
+#   gsmExchange      -> phones + tablets + accessories (NOT laptops), global.
+#   IndiaMART        -> everything incl. MacBooks/laptops, India.
+#   Cashify SuperSale-> phones (dormant adapter; modeled floor only).
+_B2B_FAMILY_COVERAGE: dict[str, set[str]] = {
+    "gsmexchange": {"iPhone", "iPad", "Watch", "AirPods"},
+    "indiamart": {"iPhone", "iPad", "Mac", "Watch", "AirPods"},
+    "cashify_supersale": {"iPhone"},
+}
+
+# Hub city used to label a B2B lot per region (B2B doesn't feed city arbitrage —
+# that's retail-only and excludes b2b via load_listings — so this is just a tag).
+_REGION_HUB: dict[str, str] = {
+    "IN": "Mumbai", "AE": "Dubai", "US": "New York",
+    "GB": "London", "SG": "Singapore", "HK": "Hong Kong",
+}
+
+_B2B_SUPPLIERS_GLOBAL = [
+    "Shenzhen Cellular Co", "HK Tech Distribution", "Dubai Re-Export FZE",
+    "Gulf Mobile Trading", "Pacific Wholesale Inc", "EuroStock Traders",
+]
+_B2B_SUPPLIERS_IN = [
+    "Remac Mumbai", "Delhi Mobile Traders", "Nehru Place Distributors",
+    "SP Road Wholesale", "Chennai Gadget Hub",
+]
+
+# Lot sizes a wholesaler offers, weighted toward small/medium lots.
+_B2B_LOT_SIZES = [5, 10, 25, 50, 100, 250]
+_B2B_LOT_WEIGHTS = [0.30, 0.27, 0.20, 0.13, 0.07, 0.03]
+
+
+def build_b2b_rng(cfg: MapleConfig | None = None) -> random.Random:
+    """Separate RNG for the B2B segment (seed+3) — retail streams stay identical."""
+    cfg = cfg or get_config()
+    return random.Random(cfg.infra.mock_seed + 3)
+
+
+def _b2b_volume_discount(cfg: MapleConfig, qty: int) -> float:
+    """Discount off single-unit wholesale for a given lot size."""
+    disc = 0.0
+    for tier in sorted(cfg.b2b.volume_tiers, key=lambda t: t[0]):
+        if qty >= tier[0]:
+            disc = tier[1]
+    return disc
+
+
+def _b2b_listing_count(device, platform, rng: random.Random) -> int:
+    """How many distinct lot offers exist for a device on a source (often 0–2)."""
+    family = getattr(device, "family", "iPhone")
+    base = 0.9 if family == "iPhone" else 0.6 * _FAMILY_POPULARITY.get(family, 0.7)
+    return max(0, int(round(base * rng.uniform(0.0, 1.8))))
+
+
+def _make_b2b_listing(cfg, device, platform, true_val, region, region_level, as_of, rng) -> dict:
+    """One wholesale lot offer: a per-unit price, a grade and a lot quantity."""
+    b2b = cfg.b2b
+    qty = rng.choices(_B2B_LOT_SIZES, weights=_B2B_LOT_WEIGHTS, k=1)[0]
+    grade = _weighted_choice(
+        rng, list(b2b.lot_grade_mix), [b2b.lot_grade_mix[g] for g in b2b.lot_grade_mix]
+    )
+    cond_mult = cfg.condition_multipliers.get(grade, 1.0)
+    disc = _b2b_volume_discount(cfg, qty)
+
+    # Wholesale per-unit price: source level (platform.index) × region level ×
+    # grade × volume discount × noise. Always stored in INR for comparability.
+    unit_inr = true_val * platform.index * region_level * cond_mult * (1 - disc) * _noise(rng)
+    unit_inr = round(unit_inr / 50) * 50
+
+    if platform.currency == "USD":
+        native = round(unit_inr / cfg.usd_to_inr, 0)
+    elif platform.currency == "AED":
+        native = round(unit_inr / cfg.aed_to_inr, 0)
+    else:
+        native = unit_inr
+
+    city = _REGION_HUB.get(region, "Mumbai")
+    supplier_pool = _B2B_SUPPLIERS_GLOBAL if platform.region == "GL" else _B2B_SUPPLIERS_IN
+    supplier = rng.choice(supplier_pool)
+    age_days = int(rng.triangular(0, 21, 4))
+    listing_date = as_of - timedelta(days=age_days)
+    url = f"https://demo.maple.local/b2b/{platform.key}/{device.sku}/{rng.randint(10000, 99999)}"
+
+    return {
+        "platform": platform.key,
+        "region": region,
+        "segment": "b2b",
+        "sku": device.sku,
+        "series": getattr(device, "series", 0),
+        "model": device.model,
+        "variant": getattr(device, "variant", ""),
+        "storage": device.storage,
+        "battery_health": {"Almost New": 98, "Superb": 92, "Good": 87, "Fair": 81}.get(grade, 90),
+        "condition": grade,
+        "raw_condition": f"{grade} (wholesale lot)",
+        "city": city,
+        "asking_price": float(unit_inr),         # per-unit INR
+        "asking_price_native": float(native),     # per-unit, source currency
+        "currency": platform.currency,
+        "quantity": int(qty),                      # lot size on offer
+        "seller_type": "wholesaler",
+        "seller_name": supplier,
+        "seller_rating": round(rng.uniform(4.0, 4.9), 1),
+        "seller_reviews": rng.randint(5, 400),
+        "warranty": "Trade terms (no consumer warranty)",
+        "accessories": "Bulk packed",
+        "lock_status": "Factory Unlocked",
+        "verified": rng.random() < 0.7,
+        "negotiable": True,
+        "views": 0,
+        "color": "",
+        "listing_title": f"{device.model} {device.storage} · {grade} · lot of {qty} ({_REGION_HUB.get(region, region)})",
+        "listing_date": listing_date,
+        "url": url,
+    }
+
+
+def generate_b2b_listings(cfg: MapleConfig, as_of: date, rng: random.Random) -> list[dict]:
+    """Synthesize the B2B wholesale market across every b2b_wholesale source.
+
+    Spread over global regions for gsmExchange (the live global price map);
+    India-only for IndiaMART / SuperSale. Covers iPhones AND the non-phone Apple
+    families (MacBooks, iPads, Watch, AirPods) per each source's real coverage.
+    """
+    listings: list[dict] = []
+    devices = iphone_devices() + EXTRA_DEVICES
+    for platform in cfg.b2b_platforms():
+        coverage = _B2B_FAMILY_COVERAGE.get(platform.key, {"iPhone"})
+        if platform.region == "GL":
+            region_levels = dict(cfg.b2b.global_regions)
+        else:
+            region_levels = {platform.region: 1.0}
+        for device in devices:
+            if getattr(device, "family", "iPhone") not in coverage:
+                continue
+            true_val = true_superb_value(device, as_of)
+            for region, region_level in region_levels.items():
+                for _ in range(_b2b_listing_count(device, platform, rng)):
+                    listings.append(
+                        _make_b2b_listing(
+                            cfg, device, platform, true_val, region, region_level, as_of, rng
+                        )
+                    )
     return listings

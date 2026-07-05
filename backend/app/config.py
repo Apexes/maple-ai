@@ -126,6 +126,16 @@ DEFAULT_GRADE_MAP: dict[str, str] = {
     "poor": "Fair",
     "heavily used": "Fair",
     "partially functional": "Fair",
+    # B2B trading-floor vocabulary (gsmExchange / wholesale trade). "New" stock
+    # on a trade floor maps to the top grade; ASIS is untested/faulty risk.
+    "new": "Almost New",
+    "brand new": "Almost New",
+    "cpo": "Superb",
+    "used and tested": "Good",
+    "14 day": "Good",
+    "7 day / 14 day": "Good",
+    "asis": "Fair",
+    "as is": "Fair",
     # Maple's own-store vocabulary (maplestore.in product titles). A Maple
     # "Pre-owned" unit is certified/tested, so it maps to the 'Superb' reference;
     # a "Demo-unit" is near-new.
@@ -142,14 +152,17 @@ DEFAULT_GRADE_MAP: dict[str, str] = {
 # Platform configuration
 # --------------------------------------------------------------------------- #
 # role:
-#   own         -> Maple's OWN store (maplestore.in). NOT a competitor — excluded
-#                  from the competitor market median; this is the price we justify.
-#   recommerce  -> refurbished retail (with warranty), sell-side reference
-#   marketplace -> C2C asking prices (optimistic, negotiable)
-#   tradein     -> buy-back / trade-in quotes (low, buy-side)
+#   own           -> Maple's OWN store (maplestore.in). NOT a competitor — excluded
+#                    from the competitor market median; this is the price we justify.
+#   recommerce    -> refurbished retail (with warranty), sell-side reference
+#   marketplace   -> C2C asking prices (optimistic, negotiable)
+#   tradein       -> buy-back / trade-in quotes (low, buy-side)
+#   b2b_wholesale -> B2B trade prices (bulk lots, below retail). A SEPARATE market
+#                    segment — excluded from the B2C/retail benchmark entirely (the
+#                    retail agents never see these), surfaced only by the B2B agent.
 # weight: trust placed in the source when computing fair-market value.
 # index : structural price level of the platform vs the market reference.
-# region: "IN" or "AE".
+# region: "IN", "AE", or "GL" (global — B2B sources spread listings across markets).
 @dataclass
 class PlatformConfig:
     key: str
@@ -159,6 +172,10 @@ class PlatformConfig:
     weight: float
     index: float
     currency: str = "INR"
+
+    @property
+    def is_b2b(self) -> bool:
+        return self.role == "b2b_wholesale"
 
 
 # The key of Maple's own store. Tracked as a data source, but excluded from the
@@ -175,10 +192,21 @@ DEFAULT_PLATFORMS: list[PlatformConfig] = [
     PlatformConfig("facebook", "Facebook Marketplace", "marketplace", "IN", 0.65, 0.88),
     PlatformConfig("apple_tradein", "Apple Trade-In", "tradein", "IN", 0.90, 0.60),
     PlatformConfig("dubai_resale", "Dubai Resale (Dubizzle)", "marketplace", "AE", 0.85, 0.83, "AED"),
+    # ---- B2B wholesale sources (separate segment; never in the retail benchmark) ----
+    # gsmExchange: global multi-seller trading floor — the backbone of the B2B price
+    # map and the live global device-pricing view (listings spread across regions).
+    PlatformConfig("gsmexchange", "gsmExchange", "b2b_wholesale", "GL", 0.90, 0.80, "USD"),
+    # IndiaMART: India B2B directory — Maple's authenticated account (cookie-injected).
+    PlatformConfig("indiamart", "IndiaMART", "b2b_wholesale", "IN", 0.85, 0.83),
+    # Cashify SuperSale: dominant competitor's B2B app. Dormant adapter (no front
+    # account); included so its structural price floor can be modeled / plugged later.
+    PlatformConfig("cashify_supersale", "Cashify SuperSale", "b2b_wholesale", "IN", 0.80, 0.78),
 ]
 
 # AED -> INR conversion used to compare Dubai listings against India.
 DEFAULT_AED_TO_INR: float = 23.0
+# USD -> INR conversion used to restate gsmExchange (global B2B) prices into INR.
+DEFAULT_USD_TO_INR: float = 86.0
 
 
 # --------------------------------------------------------------------------- #
@@ -256,6 +284,62 @@ class PricingConfig:
 
 
 # --------------------------------------------------------------------------- #
+# B2B / wholesale segment economics
+# --------------------------------------------------------------------------- #
+# The B2B market clears BELOW the B2C retail fair value (no consumer warranty /
+# trust premium, sold in bulk, faster turn). These knobs turn the existing
+# condition-normalized fair value into a wholesale view + a volume price ladder.
+@dataclass
+class B2BConfig:
+    # Wholesale price level as a fraction of the (Superb) retail fair value.
+    wholesale_index: float = 0.82
+    # Volume discount ladder: (min_qty, discount off single-unit wholesale).
+    # Larger lots clear cheaper — this is the core B2B price signal.
+    volume_tiers: list[list[float]] = field(
+        default_factory=lambda: [[1, 0.0], [5, 0.03], [25, 0.06], [100, 0.10]]
+    )
+    # Thinner gross margin Maple targets on a wholesale (vs retail) unit.
+    b2b_target_margin_pct: float = 0.08
+    # Composition of a typical mixed-grade wholesale lot (must sum ~1.0).
+    lot_grade_mix: dict[str, float] = field(
+        default_factory=lambda: {"Almost New": 0.15, "Superb": 0.40, "Good": 0.30, "Fair": 0.15}
+    )
+    # Regions the global B2B map spreads gsmExchange listings across, with a
+    # structural price level per region vs the global reference (USD wholesale).
+    global_regions: dict[str, float] = field(
+        default_factory=lambda: {
+            "IN": 0.96,  # India — slightly below global on used Apple
+            "AE": 1.00,  # UAE — the reference re-export hub
+            "US": 1.08,  # USA — richest sink, highest prices
+            "GB": 1.04,  # UK
+            "SG": 1.02,  # Singapore
+            "HK": 0.98,  # Hong Kong — grey-market entrepôt
+        }
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Unit-cost structure (the "costing matters" view)
+# --------------------------------------------------------------------------- #
+# Additive decomposition of the per-unit cost. Defaults are chosen so the parts
+# SUM to the flat scalars already in PricingConfig (refurbishment_cost=1200,
+# logistics_cost=450, warranty_reserve=800) — so the retail recommendation math
+# in recommend_prices() is unchanged. The extra fee/overhead lines are surfaced
+# only by cost_breakdown() for the Costing dashboard.
+@dataclass
+class CostConfig:
+    refurb_parts: float = 700.0          # parts (screen/battery/housing)
+    refurb_labour: float = 500.0         # technician time   (parts+labour = 1200)
+    logistics_inbound: float = 200.0     # acquisition pickup / freight in
+    logistics_outbound: float = 250.0    # dispatch to buyer  (in+out = 450)
+    qc_grading: float = 150.0            # 40-point inspection & grading
+    warranty_reserve: float = 800.0      # provision for warranty claims (= PricingConfig)
+    platform_fee_pct: float = 0.020      # marketplace / channel fee on sell price
+    payment_fee_pct: float = 0.018       # payment-gateway fee on sell price
+    overhead_alloc: float = 400.0        # allocated fixed overhead per unit
+
+
+# --------------------------------------------------------------------------- #
 # Metric baselines (so KPIs read against a credible "before AI" baseline)
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -277,6 +361,8 @@ class MetricBaselines:
 class MapleConfig:
     infra: InfraSettings = field(default_factory=InfraSettings)
     pricing: PricingConfig = field(default_factory=PricingConfig)
+    b2b: B2BConfig = field(default_factory=B2BConfig)
+    costs: CostConfig = field(default_factory=CostConfig)
     baselines: MetricBaselines = field(default_factory=MetricBaselines)
     condition_multipliers: dict[str, float] = field(
         default_factory=lambda: dict(DEFAULT_CONDITION_MULTIPLIERS)
@@ -292,6 +378,7 @@ class MapleConfig:
         default_factory=lambda: list(DEFAULT_PLATFORMS)
     )
     aed_to_inr: float = DEFAULT_AED_TO_INR
+    usd_to_inr: float = DEFAULT_USD_TO_INR
 
     # ---- convenience lookups -------------------------------------------- #
     def platform(self, key: str) -> PlatformConfig | None:
@@ -301,11 +388,21 @@ class MapleConfig:
         return [p.key for p in self.platforms if region is None or p.region == region]
 
     def competitor_platforms(self, region: str | None = None) -> list[PlatformConfig]:
-        """Platforms that form the market benchmark (everything EXCEPT Maple's own store)."""
+        """Platforms that form the RETAIL market benchmark.
+
+        Excludes both Maple's own store (role 'own') AND every B2B wholesale
+        source — the retail/B2C benchmark must never be contaminated by trade
+        prices. The B2B agent looks at b2b_platforms() instead.
+        """
         return [
             p for p in self.platforms
-            if p.role != "own" and (region is None or p.region == region)
+            if p.role not in ("own", "b2b_wholesale")
+            and (region is None or p.region == region)
         ]
+
+    def b2b_platforms(self) -> list[PlatformConfig]:
+        """The B2B wholesale sources (gsmExchange, IndiaMART, SuperSale, …)."""
+        return [p for p in self.platforms if p.role == "b2b_wholesale"]
 
     def own_platform(self) -> PlatformConfig | None:
         """Maple's own store (role == 'own'), if configured."""
@@ -319,7 +416,7 @@ class MapleConfig:
     def apply_overrides(self, data: dict[str, Any]) -> None:
         if not data:
             return
-        for section in ("pricing", "baselines"):
+        for section in ("pricing", "b2b", "costs", "baselines"):
             if section in data and isinstance(data[section], dict):
                 target = getattr(self, section)
                 for k, v in data[section].items():
@@ -331,6 +428,8 @@ class MapleConfig:
                 getattr(self, mapping).update(data[mapping])
         if "aed_to_inr" in data:
             self.aed_to_inr = float(data["aed_to_inr"])
+        if "usd_to_inr" in data:
+            self.usd_to_inr = float(data["usd_to_inr"])
         if "platforms" in data and isinstance(data["platforms"], list):
             self.platforms = [PlatformConfig(**p) for p in data["platforms"]]
 

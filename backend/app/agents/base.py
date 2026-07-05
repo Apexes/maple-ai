@@ -48,6 +48,7 @@ class Agent:
         region: str | None = None,
         sku: str | None = None,
         include_own: bool = False,
+        segment: str | None = "retail",
     ) -> list[Listing]:
         """Load listings for the market benchmark.
 
@@ -55,12 +56,19 @@ class Agent:
         competitor benchmark, fair value and every existing agent measure the
         market — not Maple against itself. The Maple comparison agent opts in
         with ``include_own=True``.
+
+        ``segment`` defaults to ``"retail"`` so every existing (B2C) agent sees
+        ONLY retail listings — the B2B wholesale segment is invisible to them and
+        the retail numbers stay byte-identical. The B2B agent passes
+        ``segment="b2b"``; pass ``segment=None`` to load both.
         """
         stmt = select(Listing)
         if region:
             stmt = stmt.where(Listing.region == region)
         if sku:
             stmt = stmt.where(Listing.sku == sku)
+        if segment is not None:
+            stmt = stmt.where(Listing.segment == segment)
         if not include_own:
             own = [p.key for p in self.cfg.platforms if p.role == "own"]
             if own:

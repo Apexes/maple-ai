@@ -45,4 +45,19 @@ export const endpoints = {
   mlPricing: "/ml/pricing",
   mlPricingOne: (sku: string) => `/ml/pricing/${sku}`,
   mlForecast: "/ml/forecast",
+  // B2B wholesale segment
+  b2b: "/b2b",
+  b2bSpread: "/b2b/spread",
+  b2bGlobal: "/b2b/global",
+  b2bLadder: (sku: string) => `/b2b/device/${sku}/ladder`,
+  b2bCosting: (sku: string) => `/b2b/device/${sku}/costing`,
+  b2bQuote: "/b2b/quote",
+  // Global price globe
+  b2bGlobe: "/b2b/globe",
+  // Copilot (local-LLM pricing analyst)
+  copilotStatus: "/copilot/status",
+  copilotAsk: "/copilot/ask",
+  copilotScenario: "/copilot/scenario",
+  copilotInventoryPlan: "/copilot/inventory/plan",
+  copilotAbtest: "/copilot/abtest",
 };

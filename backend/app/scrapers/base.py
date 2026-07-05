@@ -24,10 +24,12 @@ Output of every scraper is a list of normalized listing dicts:
 """
 from __future__ import annotations
 
+import json
 import os
 import random
 import zlib
 from datetime import date
+from pathlib import Path
 
 from ..config import MapleConfig, get_config
 from ..mock_data import generate_platform_listings
@@ -39,6 +41,48 @@ class ScrapeBlocked(RuntimeError):
     """Raised by fetch_raw() when the platform blocks the scrape."""
 
 
+# --------------------------------------------------------------------------- #
+# Authenticated-session store (cookie injection for gated B2B sources)
+# --------------------------------------------------------------------------- #
+# Gated sources (IndiaMART, gsmExchange, Cashify SuperSale) are scraped through
+# a logged-in session belonging to a real account. We NEVER commit credentials:
+# a per-platform session blob (cookie jar / Playwright storage_state) is read at
+# runtime from either an env var or a gitignored file, keyed by platform_key.
+#
+#   env:  MAPLE_SESSION_<PLATFORM_KEY_UPPER>   (raw JSON)
+#   file: $MAPLE_SESSION_DIR/<platform_key>.json   (default ./secrets/sessions)
+#
+# A human logs in once to seed the blob; daily scraping keeps the session warm,
+# persisting any rotated cookie back. A missing/expired session simply raises
+# ScrapeBlocked, so the resilience contract falls back to mock-and-flag.
+def _session_dir() -> Path:
+    return Path(os.getenv("MAPLE_SESSION_DIR", "secrets/sessions"))
+
+
+def load_session(platform_key: str) -> dict | None:
+    """Return {cookies, storage_state, captured_at, …} for a platform, or None."""
+    env = os.getenv(f"MAPLE_SESSION_{platform_key.upper()}")
+    if env:
+        try:
+            return json.loads(env)
+        except Exception:  # noqa: BLE001 - malformed env blob => treat as absent
+            return None
+    path = _session_dir() / f"{platform_key}.json"
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
+def save_session(platform_key: str, session: dict) -> None:
+    """Persist a (refreshed) session blob back to the gitignored store."""
+    d = _session_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{platform_key}.json").write_text(json.dumps(session, indent=2, default=str))
+
+
 class BaseScraper:
     platform_key: str = ""
     platform_name: str = ""
@@ -46,9 +90,16 @@ class BaseScraper:
     base_url: str = ""
     # Per-platform selector map — illustrative, the real values live here.
     selectors: dict[str, str] = {}
+    # Gated sources set this True; fetch_raw() then needs an authenticated session.
+    requires_auth: bool = False
 
     def __init__(self, cfg: MapleConfig | None = None):
         self.cfg = cfg or get_config()
+
+    # --- authenticated session (cookie injection) ------------------------ #
+    def session(self) -> dict | None:
+        """The logged-in session blob for this platform (None if not seeded)."""
+        return load_session(self.platform_key)
 
     # --- BrightData / Playwright wiring ---------------------------------- #
     @property
@@ -107,3 +158,34 @@ class BaseScraper:
             raw.get("battery_health"),
         )
         return raw
+
+
+class B2BWholesaleScraper(BaseScraper):
+    """Base for gated B2B wholesale sources scraped via an authenticated session.
+
+    Concrete adapters (IndiaMART, gsmExchange, SuperSale) inherit this. Until a
+    real parser is wired AND a session is seeded, ``fetch_raw`` raises so the
+    resilience contract falls back to this source's synthetic B2B slice — which
+    is exactly how the POC stays live with the adapters dormant.
+    """
+
+    requires_auth = True
+
+    def fetch_raw(self, devices: list | None = None) -> list[dict]:
+        sess = self.session()
+        if not sess:
+            raise ScrapeBlocked(
+                f"{self.platform_key}: no authenticated session (seed a cookie blob)"
+            )
+        # A real session is present, but the live HTML/JSON parser for this
+        # gated source is not implemented in the POC — fall back to mock.
+        raise ScrapeBlocked(
+            f"{self.platform_key}: live parser not implemented (POC); using mock"
+        )
+
+    def _mock_listings(self, as_of: date) -> list[dict]:
+        """This source's slice of the deterministic synthetic B2B market."""
+        from ..mock_data import build_b2b_rng, generate_b2b_listings
+
+        rows = generate_b2b_listings(self.cfg, as_of, build_b2b_rng(self.cfg))
+        return [r for r in rows if r["platform"] == self.platform_key]

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, DateTime, Float, Integer, String, Index, func
+from sqlalchemy import Boolean, Date, DateTime, Float, Integer, LargeBinary, String, Index, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
@@ -18,6 +18,8 @@ class Listing(Base):
 
     platform: Mapped[str] = mapped_column(String(40), index=True)
     region: Mapped[str] = mapped_column(String(4), default="IN", index=True)
+    # Market segment: "retail" (B2C, default) or "b2b" (wholesale lots).
+    segment: Mapped[str] = mapped_column(String(8), default="retail", index=True)
 
     # Device identity
     sku: Mapped[str] = mapped_column(String(40), index=True)
@@ -38,6 +40,8 @@ class Listing(Base):
     currency: Mapped[str] = mapped_column(String(4), default="INR")
 
     seller_type: Mapped[str] = mapped_column(String(40), default="individual")
+    # Lot size on offer (B2B wholesale); 1 for single-unit retail listings.
+    quantity: Mapped[int] = mapped_column(Integer, default=1)
 
     # Publicly-scrapable listing detail (powers the per-device breakdown tab).
     color: Mapped[str] = mapped_column(String(40), default="")
@@ -59,6 +63,27 @@ class Listing(Base):
     __table_args__ = (
         Index("ix_listings_sku_platform", "sku", "platform"),
         Index("ix_listings_sku_city", "sku", "city"),
+    )
+
+
+class ScrapeRaw(Base):
+    """Immutable raw-scrape archive: every live page fetched, gzip-compressed.
+
+    The ingestion layer parses listings OUT of these payloads; keeping the raw
+    bytes means a parser bug or a site layout change never loses data — we can
+    always re-parse history. This is the seed of the future data lake.
+    """
+
+    __tablename__ = "scrape_raw"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    platform: Mapped[str] = mapped_column(String(40), index=True)
+    url: Mapped[str] = mapped_column(String(500))
+    status: Mapped[int] = mapped_column(Integer, default=0)          # HTTP status
+    content_gz: Mapped[bytes] = mapped_column(LargeBinary)           # gzipped body
+    content_bytes: Mapped[int] = mapped_column(Integer, default=0)   # uncompressed size
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), index=True
     )
 
 

@@ -45,9 +45,14 @@ def _build(as_of: str, out: Path) -> None:
     from app.config import get_config
     from app.db import SessionLocal, engine, init_db
     from app.ml.train import train_from_listings
-    from app.mock_data import build_rng, generate_history_real
+    from app.mock_data import (
+        build_rng,
+        build_extra_rng,
+        generate_history_real,
+        generate_extended_listings,
+    )
     from app.models import DeviceDaily, Listing, MarketDaily
-    from app.scrapers import run_all_scrapers
+    from app.scrapers import run_all_scrapers, run_b2b_scrapers
     from app.seed import _insert_listings, _update_today_counts
     from app.util import as_of_date
 
@@ -60,6 +65,21 @@ def _build(as_of: str, out: Path) -> None:
     listings, report = run_all_scrapers(as_of_d)
     for r in report:
         print(f"    {r['platform']:<14} {r['source']:<5} {r['count']}")
+
+    # Non-iPhone Apple extras (IN) are synthesized on their own RNG stream
+    # (retail benchmark untouched) so real mode keeps full catalogue coverage.
+    listings += generate_extended_listings(cfg, as_of_d, build_extra_rng(cfg))
+
+    # B2B wholesale segment: scraped LIVE (gsmExchange trading floor +
+    # IndiaMART directory). Each adapter falls back to its synthetic slice on
+    # failure, so the build always completes.
+    print("[build-real] scraping live B2B wholesale sources …")
+    b2b_listings, b2b_report = run_b2b_scrapers(as_of_d)
+    for r in b2b_report:
+        print(f"    {r['platform']:<18} {r['source']:<5} {r['count']}")
+    listings += b2b_listings
+    report = report + b2b_report
+    print(f"[build-real] + extras + B2B -> {len(listings)} total listings")
 
     with SessionLocal() as db:
         db.execute(delete(Listing))
@@ -124,9 +144,9 @@ def _build(as_of: str, out: Path) -> None:
 
 
 _LISTING_FIELDS = (
-    "platform", "region", "sku", "series", "model", "variant", "storage",
+    "platform", "region", "segment", "sku", "series", "model", "variant", "storage",
     "battery_health", "condition", "raw_condition", "city",
-    "asking_price", "asking_price_native", "currency", "seller_type",
+    "asking_price", "asking_price_native", "currency", "seller_type", "quantity",
     "color", "listing_title", "seller_name", "seller_rating", "seller_reviews",
     "warranty", "accessories", "lock_status", "verified", "negotiable", "views",
     "listing_date", "url",

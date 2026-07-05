@@ -10,6 +10,9 @@ const NAV = [
   { href: "/competitors", label: "Competitors", icon: "▤" },
   { href: "/devices", label: "Device Pricing", icon: "▦" },
   { href: "/maple", label: "Maple vs Market", icon: "⚖" },
+  { href: "/b2b", label: "B2B Wholesale", icon: "⊞" },
+  { href: "/globe", label: "Price Globe", icon: "◍" },
+  { href: "/copilot", label: "Copilot", icon: "✦" },
   { href: "/dubai", label: "Dubai Expansion", icon: "⇄" },
   { href: "/inventory", label: "Inventory", icon: "▣" },
 ];

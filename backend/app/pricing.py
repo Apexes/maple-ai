@@ -282,3 +282,168 @@ def recommend_all_conditions(
         cond: recommend_prices(fair_value_superb, cond, cfg)
         for cond in cfg.condition_multipliers
     }
+
+
+# --------------------------------------------------------------------------- #
+# B2B / wholesale unit economics
+# --------------------------------------------------------------------------- #
+@dataclass
+class B2BUnitEconomics:
+    condition: str
+    quantity: int
+    retail_fair_value: float       # the B2C condition-adjusted fair value (reference)
+    wholesale_unit: float          # per-unit wholesale SELL at this quantity
+    volume_discount_pct: float     # discount applied for the lot size
+    recommended_buy: float         # what Maple should pay per unit to hit B2B margin
+    expected_gross_margin: float   # INR per unit
+    expected_gross_margin_pct: float
+    lot_total: float               # wholesale_unit * quantity
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def b2b_unit_economics(
+    fair_value_superb: float,
+    condition: str,
+    quantity: int = 1,
+    cfg: MapleConfig | None = None,
+) -> B2BUnitEconomics:
+    """Per-unit wholesale price + margin for a given grade and lot size.
+
+    Wholesale clears below the B2C retail fair value (b2b.wholesale_index) and
+    drops further with volume (b2b.volume_tiers). Maple's B2B buy price is the
+    wholesale sell less the thinner B2B target margin and the trade costs (refurb
+    + logistics; no consumer warranty reserve on trade terms).
+    """
+    cfg = cfg or get_config()
+    b = cfg.b2b
+    c = cfg.costs
+    cond_mult = cfg.condition_multipliers.get(condition, 1.0)
+
+    retail_fair = fair_value_superb * cond_mult
+
+    # Volume discount for this lot size.
+    disc = 0.0
+    for tier in sorted(b.volume_tiers, key=lambda t: t[0]):
+        if quantity >= tier[0]:
+            disc = tier[1]
+
+    wholesale_unit = retail_fair * b.wholesale_index * (1 - disc)
+
+    trade_costs = c.refurb_parts + c.refurb_labour + c.logistics_inbound + c.logistics_outbound + c.qc_grading
+    target_margin = wholesale_unit * b.b2b_target_margin_pct
+    buy = wholesale_unit - target_margin - trade_costs
+
+    total_cost = buy + trade_costs
+    gm = wholesale_unit - total_cost
+    gm_pct = gm / wholesale_unit if wholesale_unit else 0.0
+
+    return B2BUnitEconomics(
+        condition=condition,
+        quantity=quantity,
+        retail_fair_value=round(retail_fair, 0),
+        wholesale_unit=round(wholesale_unit, 0),
+        volume_discount_pct=round(disc * 100, 1),
+        recommended_buy=round(buy, 0),
+        expected_gross_margin=round(gm, 0),
+        expected_gross_margin_pct=round(gm_pct, 4),
+        lot_total=round(wholesale_unit * quantity, 0),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Full per-unit cost waterfall (the "costing matters" view)
+# --------------------------------------------------------------------------- #
+@dataclass
+class CostBreakdown:
+    condition: str
+    segment: str                 # "retail" or "b2b"
+    sell_price: float
+    acquisition_cost: float      # what Maple pays to buy the unit
+    refurb_parts: float
+    refurb_labour: float
+    logistics_inbound: float
+    logistics_outbound: float
+    qc_grading: float
+    warranty_reserve: float      # 0 for b2b (trade terms)
+    platform_fee: float          # pct of sell
+    payment_fee: float           # pct of sell
+    overhead_alloc: float
+    total_cost: float
+    net_margin: float            # sell - total_cost (AFTER all costs, incl fees/overhead)
+    net_margin_pct: float
+    breakeven_sell: float        # sell price at which net margin == 0
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def cost_breakdown(
+    fair_value_superb: float,
+    condition: str,
+    segment: str = "retail",
+    quantity: int = 1,
+    cfg: MapleConfig | None = None,
+) -> CostBreakdown:
+    """Decompose a unit into its FULL cost stack and the true NET margin.
+
+    This is intentionally fuller than recommend_prices()'s gross margin: it adds
+    QC, channel/payment fees and allocated overhead, so the dashboard can show
+    how a headline gross margin erodes to the real net margin per unit. Segment
+    'b2b' uses wholesale economics (b2b_unit_economics) and drops the consumer
+    warranty reserve.
+    """
+    cfg = cfg or get_config()
+    c = cfg.costs
+
+    if segment == "b2b":
+        econ = b2b_unit_economics(fair_value_superb, condition, quantity, cfg)
+        sell = econ.wholesale_unit
+        acquisition = econ.recommended_buy
+        warranty_reserve = 0.0
+    else:
+        reco = recommend_prices(fair_value_superb, condition, cfg)
+        sell = reco.recommended_sell
+        acquisition = reco.recommended_buy
+        warranty_reserve = c.warranty_reserve
+
+    platform_fee = sell * c.platform_fee_pct
+    payment_fee = sell * c.payment_fee_pct
+
+    total_cost = (
+        acquisition + c.refurb_parts + c.refurb_labour
+        + c.logistics_inbound + c.logistics_outbound + c.qc_grading
+        + warranty_reserve + platform_fee + payment_fee + c.overhead_alloc
+    )
+    net = sell - total_cost
+    net_pct = net / sell if sell else 0.0
+
+    # Break-even sell: fixed costs / (1 - variable fee fraction).
+    fixed = (
+        acquisition + c.refurb_parts + c.refurb_labour
+        + c.logistics_inbound + c.logistics_outbound + c.qc_grading
+        + warranty_reserve + c.overhead_alloc
+    )
+    fee_frac = c.platform_fee_pct + c.payment_fee_pct
+    breakeven = fixed / (1 - fee_frac) if fee_frac < 1 else fixed
+
+    return CostBreakdown(
+        condition=condition,
+        segment=segment,
+        sell_price=round(sell, 0),
+        acquisition_cost=round(acquisition, 0),
+        refurb_parts=round(c.refurb_parts, 0),
+        refurb_labour=round(c.refurb_labour, 0),
+        logistics_inbound=round(c.logistics_inbound, 0),
+        logistics_outbound=round(c.logistics_outbound, 0),
+        qc_grading=round(c.qc_grading, 0),
+        warranty_reserve=round(warranty_reserve, 0),
+        platform_fee=round(platform_fee, 0),
+        payment_fee=round(payment_fee, 0),
+        overhead_alloc=round(c.overhead_alloc, 0),
+        total_cost=round(total_cost, 0),
+        net_margin=round(net, 0),
+        net_margin_pct=round(net_pct, 4),
+        breakeven_sell=round(breakeven, 0),
+    )

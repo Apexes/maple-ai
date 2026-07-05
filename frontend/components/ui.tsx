@@ -43,7 +43,7 @@ export function KpiCard({
   label: string;
   value: React.ReactNode;
   sub?: React.ReactNode;
-  accent?: "maple" | "amber" | "sky" | "rose" | "slate";
+  accent?: "maple" | "amber" | "sky" | "rose" | "slate" | "violet";
   delta?: number;
 }) {
   const ring: Record<string, string> = {
@@ -52,6 +52,7 @@ export function KpiCard({
     sky: "before:bg-sky-500",
     rose: "before:bg-rose-500",
     slate: "before:bg-slate-500",
+    violet: "before:bg-violet-500",
   };
   return (
     <div

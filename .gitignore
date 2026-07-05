@@ -14,9 +14,14 @@ node_modules/
 out/
 .env.local
 npm-debug.log*
+*.tsbuildinfo
 
 # Env
 backend/.env
+
+# Authenticated scraper sessions (cookie jars / storage_state) — NEVER commit
+secrets/
+backend/secrets/
 
 # OS / editors
 .DS_Store
